@@ -6,7 +6,9 @@ The aim is to allow new delevopers of rust packages, to deploy their application
 ## Bundle packages
 
 - `rpm`: precompiled rpm to ship
+  uses `cargo-generate-rpm`
 - `deb`: precompiled dep to ship
+  uses `cargo-deb`
 
 ### Arquitectures
 
