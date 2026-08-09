@@ -10,13 +10,28 @@ on:
         required: false
         default: '.'
         type: string
+      deps_x86_64:
+        description: 'Dependencias APT para x86_64 (ej: libssl-dev)'
+        required: false
+        default: ''
+        type: string
+      deps_aarch64:
+        description: 'Dependencias APT para aarch64 (ej: libssl-dev:arm64)'
+        required: false
+        default: ''
+        type: string
+      deps_armv7:
+        description: 'Dependencias APT para armv7 (ej: libssl-dev:armhf)'
+        required: false
+        default: ''
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
 
@@ -27,12 +42,18 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             name: x86_64
             linker: ""
+            dpkg_arch: ""
+            pkg_config_path: "/usr/lib/x86_64-linux-gnu/pkgconfig"
           - target: aarch64-unknown-linux-gnu
             name: aarch64
             linker: gcc-aarch64-linux-gnu
+            dpkg_arch: "arm64"
+            pkg_config_path: "/usr/lib/aarch64-linux-gnu/pkgconfig"
           - target: armv7-unknown-linux-gnueabihf
             name: armv7
             linker: gcc-arm-linux-gnueabihf
+            dpkg_arch: "armhf"
+            pkg_config_path: "/usr/lib/arm-linux-gnueabihf/pkgconfig"
 
     defaults:
       run:
@@ -49,11 +70,52 @@ jobs:
         with:
           workspaces: ${{ inputs.path }}
 
+      - name: Map dynamic dependencies
+        run: |
+          # Map inputs to environment variables based on the active matrix architecture
+          if [ "${{ matrix.name }}" == "x86_64" ]; then
+            echo "TARGET_DEPS=${{ inputs.deps_x86_64 }}" >> $GITHUB_ENV
+          elif [ "${{ matrix.name }}" == "aarch64" ]; then
+            echo "TARGET_DEPS=${{ inputs.deps_aarch64 }}" >> $GITHUB_ENV
+          elif [ "${{ matrix.name }}" == "armv7" ]; then
+            echo "TARGET_DEPS=${{ inputs.deps_armv7 }}" >> $GITHUB_ENV
+          fi
+
+      - name: Configure Multi-Arch repositories
+        if: matrix.dpkg_arch != ''
+        run: |
+          # Get OS codename dynamically (e.g., noble for 24.04)
+          OS_CODENAME=$(lsb_release -sc)
+          
+          # Restrict default Ubuntu repositories to amd64 only
+          sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+          
+          # Create a new deb822 source file pointing to ubuntu-ports for arm64 and armhf
+          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: $OS_CODENAME ${OS_CODENAME}-updates ${OS_CODENAME}-backports ${OS_CODENAME}-security
+          Components: main universe restricted multiverse
+          Architectures: arm64 armhf
+          EOF
+
       - name: Install cross-compilation tools
         if: matrix.linker != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.linker }}
+
+      - name: Install system dependencies per architecture
+        if: env.TARGET_DEPS != ''
+        run: |
+          # Register the target architecture in dpkg
+          if [ -n "${{ matrix.dpkg_arch }}" ]; then
+            sudo dpkg --add-architecture ${{ matrix.dpkg_arch }}
+          fi
+          
+          # Update and install required C dependencies
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.TARGET_DEPS }} pkg-config
 
       - name: Install packaging tools
         uses: taiki-e/install-action@v2
@@ -65,6 +127,9 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          PKG_CONFIG_ALLOW_CROSS: 1
+          PKG_CONFIG_SYSROOT_DIR: /
+          PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
 
       - name: Generate DEB Package
         run: cargo deb --target ${{ matrix.target }} --no-build
@@ -75,11 +140,13 @@ jobs:
       - name: Get version
         id: get_version
         run: |
+          # Extract version from Cargo.toml
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           echo "version=$VERSION" >> $GITHUB_ENV
 
       - name: Prepare Binary for upload
         run: |
+          # Move and rename binary for artifacts
           TARGET="target/${{ matrix.target }}/release"
           mv "$TARGET/${{ inputs.binary }}" "$TARGET/${{ inputs.binary }}-${{ matrix.name }}-v${{ env.version }}"
 
