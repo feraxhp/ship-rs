@@ -25,6 +25,18 @@ on:
         required: false
         default: ''
         type: string
+      firm:
+        description: 'Sign generated binaries and packages with GPG before publishing'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      GPG_PRIVATE_KEY:
+        description: 'ASCII-armored GPG private key for signing release artifacts'
+        required: false
+      GPG_PASSPHRASE:
+        description: 'Passphrase for the GPG private key (optional if the key has no passphrase)'
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,6 +73,23 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate GPG secrets
+        if: inputs.firm
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::Signing is enabled (firm: true), but the GPG_PRIVATE_KEY secret was not provided."
+            exit 1
+          fi
+          
+          if [ -z "$GPG_PASSPHRASE" ]; then
+            echo "::error::Signing is enabled (firm: true), but the GPG_PASSPHRASE secret was not provided."
+            exit 1
+          fi
+          
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
@@ -149,6 +178,44 @@ jobs:
           # Move and rename binary for artifacts
           TARGET="target/${{ matrix.target }}/release"
           mv "$TARGET/${{ inputs.binary }}" "$TARGET/${{ inputs.binary }}-${{ matrix.name }}-v${{ env.version }}"
+
+      - name: Install signing tools
+        if: inputs.firm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm debsigs
+
+      - name: Import GPG key
+        id: import_gpg
+        if: inputs.firm
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Sign release artifacts
+        if: inputs.firm
+        run: |
+          TARGET="target/${{ matrix.target }}"
+          FINGERPRINT="${{ steps.import_gpg.outputs.fingerprint }}"
+
+          # Sign standalone binary with a detached ASCII-armored signature (.asc)
+          BIN_FILE="$TARGET/release/${{ inputs.binary }}-${{ matrix.name }}-v${{ env.version }}"
+          gpg --batch --yes -u "$FINGERPRINT" --armor --output "$BIN_FILE.asc" --detach-sign "$BIN_FILE"
+
+          # Embed GPG signature in RPM header (verified by dnf/rpm)
+          for rpm_file in "$TARGET/generate-rpm/"*.rpm; do
+            if [ -f "$rpm_file" ]; then
+              rpmsign -D "_gpg_name $FINGERPRINT" --addsign "$rpm_file"
+            fi
+          done
+
+          # Embed GPG signature in DEB archive (verified by debsig-verify)
+          for deb_file in "$TARGET/debian/"*.deb; do
+            if [ -f "$deb_file" ]; then
+              debsigs --sign=origin --default-key="$FINGERPRINT" "$deb_file"
+            fi
+          done
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
